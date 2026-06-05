@@ -1,0 +1,18 @@
+[Unit]
+Description=HostBook Host Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/hostbook/hostbook-agent.py
+Restart=always
+RestartSec=30
+Environment=HOSTBOOK_API=http://192.168.1.10:8080
+Environment=AGENT_TOKEN=changeme-agent-secret
+Environment=INTERVAL=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
