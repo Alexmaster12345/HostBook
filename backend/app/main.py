@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import init_db
+from app.database import init_db, SessionLocal
 from app.routers import auth, assets, reservations, agent, reports, users
+from app import logic
 
 app = FastAPI(
     title="HostBook API",
@@ -29,6 +30,11 @@ app.include_router(reports.router)
 @app.on_event("startup")
 def startup():
     init_db()
+    db = SessionLocal()
+    try:
+        logic.expire_past_reservations(db)
+    finally:
+        db.close()
 
 
 @app.get("/healthz")

@@ -10,8 +10,8 @@ HostBook CLI
   python3 dashboard.py status       # show who is using a host
 """
 
-import os, sys, sqlite3, argparse, socket, subprocess, platform, time, shutil
-from datetime import datetime
+import os, sys, sqlite3, argparse, socket, subprocess, platform, time
+from datetime import datetime, timedelta
 
 DB = os.path.join(os.path.dirname(__file__), "hostbook_local.db")
 
@@ -41,13 +41,21 @@ def db():
         )""")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            hostname   TEXT NOT NULL,
-            username   TEXT NOT NULL,
-            schedule   TEXT NOT NULL,
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            hostname    TEXT NOT NULL,
+            username    TEXT NOT NULL,
+            schedule    TEXT NOT NULL,
+            duration_min INTEGER NOT NULL DEFAULT 60,
             reserved_at TEXT DEFAULT (datetime('now')),
+            ends_at     TEXT,
             FOREIGN KEY(hostname) REFERENCES hosts(hostname)
         )""")
+    # migrate: add ends_at / duration_min if they don't exist yet
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(reservations)").fetchall()]
+    if "ends_at" not in cols:
+        conn.execute("ALTER TABLE reservations ADD COLUMN ends_at TEXT")
+    if "duration_min" not in cols:
+        conn.execute("ALTER TABLE reservations ADD COLUMN duration_min INTEGER DEFAULT 60")
     conn.commit()
     return conn
 
@@ -55,7 +63,7 @@ def db():
 def get_hosts(conn):
     rows = conn.execute("""
         SELECT h.hostname, h.product, h.status,
-               r.username, r.schedule, r.reserved_at
+               r.username, r.schedule, r.reserved_at, r.ends_at, r.duration_min
         FROM hosts h
         LEFT JOIN reservations r ON r.hostname = h.hostname
         ORDER BY h.hostname
@@ -93,71 +101,107 @@ def live_host_info():
     return hostname, product, users, uptime
 
 
+# ── Countdown helper ──────────────────────────────────────────────────────────
+def countdown(ends_at_str: str) -> tuple[str, str]:
+    """Return (plain_text, colored_text) countdown for a reservation."""
+    try:
+        ends = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
+        secs = int((ends - datetime.now()).total_seconds())
+        if secs <= 0:
+            return "expired", f"{RED}expired{R}"
+        h, rem = divmod(secs, 3600)
+        m, s   = divmod(rem, 60)
+        text   = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+        clr    = GREEN if secs > 3600 else (YELLOW if secs > 300 else RED)
+        return text, f"{clr}{text}{R}"
+    except Exception:
+        return "—", "—"
+
+
 # ── Rendering ─────────────────────────────────────────────────────────────────
 def render(rows, live=False):
     cols = ["Host", "Product", "User", "Schedule", "Status"]
 
-    # Inject live host status into its row if it exists in DB
     hostname = socket.gethostname()
     lh, lp, lusers, luptime = live_host_info()
 
-    display = []
+    # Build display rows — (plain_text_tuple, colored_text_tuple)
+    plain_rows   = []
+    colored_rows = []
+
     for r in rows:
         h  = r["hostname"]
         p  = r["product"] or "—"
         st = r["status"]
+
         if r["username"]:
-            u    = r["username"]
-            sch  = r["schedule"]
+            u = r["username"]
+            if r.get("ends_at"):
+                plain_sch, color_sch = countdown(r["ends_at"])
+            else:
+                plain_sch = color_sch = r["schedule"]
         elif h == hostname:
-            # live data for current host
-            u   = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
-            sch = luptime
-            st  = "in_use" if lusers else "available"
+            u = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
+            plain_sch = color_sch = luptime
+            st = "in_use" if lusers else "available"
         else:
-            u   = "—"
-            sch = "—"
-        display.append((h, p, u, sch, st))
+            u = plain_sch = color_sch = "—"
 
-    # If DB empty, show current host only
-    if not display:
-        u   = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
-        st  = "in_use" if lusers else "available"
-        display = [(lh, lp, u, luptime, st)]
+        plain_rows.append((h, p, u, plain_sch, st))
+        colored_rows.append((h, p, u, color_sch, st))
 
-    widths = [max(len(cols[i]), max(len(r[i]) for r in display)) for i in range(5)]
+    if not plain_rows:
+        u  = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
+        st = "in_use" if lusers else "available"
+        plain_rows   = [(lh, lp, u, luptime, st)]
+        colored_rows = [(lh, lp, u, luptime, st)]
 
-    def fmt(vals, header=False):
+    # Column widths based on plain text (no ANSI codes)
+    widths = [max(len(cols[i]), max(len(r[i]) for r in plain_rows)) for i in range(5)]
+
+    def fmt(plain_vals, color_vals=None, header=False):
+        color_vals = color_vals or plain_vals
         parts = []
-        for i, v in enumerate(vals):
-            w = widths[i]
-            if header:   parts.append(f"{BOLD}{v:<{w}}{R}")
-            elif i == 0: parts.append(f"{BOLD}{BLUE}{v:<{w}}{R}")
-            elif i == 2: parts.append(f"{CYAN}{v:<{w}}{R}")
-            elif i == 4: parts.append(f"{STATUS_CLR.get(v, R)}{v:<{w}}{R}")
-            else:        parts.append(f"{v:<{w}}")
+        for i, (pv, cv) in enumerate(zip(plain_vals, color_vals)):
+            w   = widths[i]
+            pad = w - len(pv)
+            lp  = pad // 2          # left padding  (center)
+            rp  = pad - lp          # right padding
+
+            if header:
+                parts.append(f"{BOLD}{' '*lp}{pv}{' '*rp}{R}")
+            elif i == 0:
+                parts.append(f"{BOLD}{BLUE}{' '*lp}{cv}{' '*rp}{R}")
+            elif i == 2:
+                parts.append(f"{CYAN}{' '*lp}{cv}{' '*rp}{R}")
+            elif i == 3:
+                # Schedule — countdown already colored, just center it
+                parts.append(f"{' '*lp}{cv}{' '*rp}")
+            elif i == 4:
+                parts.append(f"{STATUS_CLR.get(pv, R)}{' '*lp}{cv}{' '*rp}{R}")
+            else:
+                parts.append(f"{' '*lp}{cv}{' '*rp}")
         return "  " + "   ".join(parts)
 
     div = "  " + "   ".join("─" * w for w in widths)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tag = f"  {DIM}live — refreshes every 3s   q=quit{R}" if live else ""
+    tag = f"  {DIM}live — q=quit{R}" if live else ""
 
-    # Clear and print
     if live:
-        print("\033[H\033[J", end="")   # clear screen
+        print("\033[H\033[J", end="")
 
     print(f"\n  {BOLD}HostBook{R}  {DIM}│{R}  {CYAN}{hostname}{R}  {DIM}│  {now}{R}{tag}\n")
     print(div)
     print(fmt(cols, header=True))
     print(div)
-    for r in display:
-        print(fmt(r))
+    for p, c in zip(plain_rows, colored_rows):
+        print(fmt(p, c))
     print(div)
 
-    in_use   = sum(1 for r in display if r[4] == "in_use")
-    reserved = sum(1 for r in display if r[4] == "reserved")
-    avail    = sum(1 for r in display if r[4] == "available")
-    print(f"\n  Total {BOLD}{len(display)}{R}   "
+    in_use   = sum(1 for r in plain_rows if r[4] == "in_use")
+    reserved = sum(1 for r in plain_rows if r[4] == "reserved")
+    avail    = sum(1 for r in plain_rows if r[4] == "available")
+    print(f"\n  Total {BOLD}{len(plain_rows)}{R}   "
           f"{GREEN}Available {avail}{R}   "
           f"{CYAN}In use {in_use}{R}   "
           f"{YELLOW}Reserved {reserved}{R}\n")
@@ -220,6 +264,51 @@ def cmd_remove(args):
     conn.close()
 
 
+def pick_duration(args) -> int:
+    """Interactively ask for duration in minutes or hours. Returns total minutes."""
+    if args.minutes:
+        return int(args.minutes)
+    if args.hours:
+        return int(float(args.hours) * 60)
+
+    print(f"\n  {BOLD}Duration unit:{R}")
+    print(f"  {CYAN}1{R}  Minutes")
+    print(f"  {CYAN}2{R}  Hours")
+    choice = input("  Choose [1/2] : ").strip()
+
+    if choice == "1":
+        val = input("  Minutes     : ").strip()
+        return int(val)
+    else:
+        val = input("  Hours       : ").strip()
+        return max(1, int(float(val) * 60))
+
+
+def fmt_duration(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} min"
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def format_schedule(duration_min: int, ends_at: datetime) -> str:
+    return f"{fmt_duration(duration_min)}  (until {ends_at.strftime('%H:%M')} UTC)"
+
+
+def time_remaining(ends_at_str: str) -> str:
+    try:
+        ends = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
+        delta = int((ends - datetime.now()).total_seconds())
+        if delta <= 0:
+            return f"{RED}expired{R}"
+        h, r = divmod(delta, 3600)
+        m    = r // 60
+        clr  = GREEN if delta > 3600 else (YELLOW if delta > 600 else RED)
+        return f"{clr}{fmt_duration(h*60+m)} left{R}"
+    except Exception:
+        return "—"
+
+
 def cmd_reserve(args):
     hostname = args.host or input("  Hostname  : ").strip()
     conn = db()
@@ -234,23 +323,33 @@ def cmd_reserve(args):
     # Check if already reserved
     existing = conn.execute("SELECT * FROM reservations WHERE hostname=?", (hostname,)).fetchone()
     if existing:
-        since = existing["reserved_at"]
-        print(f"\n  {YELLOW}⚠  RESERVED{R}  —  {BOLD}{hostname}{R} is already in use\n")
-        print(f"  {DIM}User     :{R}  {CYAN}{existing['username']}{R}")
-        print(f"  {DIM}Schedule :{R}  {existing['schedule']}")
-        print(f"  {DIM}Since    :{R}  {since}\n")
+        remaining = time_remaining(existing["ends_at"]) if existing["ends_at"] else "—"
+        print(f"\n  {YELLOW}⚠  RESERVED{R}  —  {BOLD}{hostname}{R} is already booked\n")
+        print(f"  {DIM}User      :{R}  {CYAN}{existing['username']}{R}")
+        print(f"  {DIM}Schedule  :{R}  {existing['schedule']}")
+        print(f"  {DIM}Since     :{R}  {existing['reserved_at']}")
+        print(f"  {DIM}Remaining :{R}  {remaining}\n")
         print(f"  To release: python3 dashboard.py release --host {hostname}\n")
         conn.close()
         return
 
-    username = args.user     or input("  User      : ").strip()
-    schedule = args.schedule or input("  Schedule  : ").strip() or "—"
+    username = args.user or input("  User      : ").strip()
 
-    conn.execute("INSERT INTO reservations (hostname, username, schedule) VALUES (?,?,?)",
-                 (hostname, username, schedule))
+    # ── Duration picker ───────────────────────────────────────────────
+    duration_min = pick_duration(args)
+    ends_at = datetime.now() + timedelta(minutes=duration_min)
+    schedule = format_schedule(duration_min, ends_at)
+
+    conn.execute(
+        "INSERT INTO reservations (hostname, username, schedule, duration_min, ends_at) VALUES (?,?,?,?,?)",
+        (hostname, username, schedule, duration_min, ends_at.strftime("%Y-%m-%d %H:%M:%S")),
+    )
     conn.execute("UPDATE hosts SET status='reserved' WHERE hostname=?", (hostname,))
     conn.commit()
-    print(f"\n  {GREEN}✓{R}  {BOLD}{hostname}{R} reserved by {CYAN}{username}{R}  [{schedule}]\n")
+    print(f"\n  {GREEN}✓{R}  {BOLD}{hostname}{R} reserved by {CYAN}{username}{R}")
+    print(f"  Duration  : {YELLOW}{fmt_duration(duration_min)}{R}")
+    print(f"  Ends at   : {ends_at.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"  Schedule  : {schedule}\n")
     conn.close()
 
 
@@ -282,9 +381,11 @@ def cmd_status(args):
     print(f"\n  {BOLD}{hostname}{R}  —  {clr}{host['status']}{R}")
     print(f"  Product  : {host['product']}")
     if res:
+        remaining = time_remaining(res["ends_at"]) if res["ends_at"] else "—"
         print(f"  {YELLOW}Reserved by  :{R}  {CYAN}{res['username']}{R}")
         print(f"  Schedule     :  {res['schedule']}")
         print(f"  Since        :  {res['reserved_at']}")
+        print(f"  Remaining    :  {remaining}")
     else:
         print(f"  {GREEN}No active reservation.{R}")
     print()
@@ -305,7 +406,10 @@ def main():
     p.add_argument("--host")
 
     p = sub.add_parser("reserve", help="Reserve a host")
-    p.add_argument("--host");    p.add_argument("--user");    p.add_argument("--schedule")
+    p.add_argument("--host")
+    p.add_argument("--user")
+    p.add_argument("--minutes", type=int,   help="Duration in minutes")
+    p.add_argument("--hours",   type=float, help="Duration in hours")
 
     p = sub.add_parser("release", help="Release a reservation")
     p.add_argument("--host")
