@@ -10,8 +10,8 @@ HostBook CLI
   python3 dashboard.py status       # show who is using a host
 """
 
-import os, sys, sqlite3, argparse, socket, subprocess, platform, time, shutil
-from datetime import datetime
+import os, sys, sqlite3, argparse, socket, subprocess, platform, time
+from datetime import datetime, timedelta
 
 DB = os.path.join(os.path.dirname(__file__), "hostbook_local.db")
 
@@ -41,13 +41,21 @@ def db():
         )""")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reservations (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            hostname   TEXT NOT NULL,
-            username   TEXT NOT NULL,
-            schedule   TEXT NOT NULL,
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            hostname    TEXT NOT NULL,
+            username    TEXT NOT NULL,
+            schedule    TEXT NOT NULL,
+            duration_min INTEGER NOT NULL DEFAULT 60,
             reserved_at TEXT DEFAULT (datetime('now')),
+            ends_at     TEXT,
             FOREIGN KEY(hostname) REFERENCES hosts(hostname)
         )""")
+    # migrate: add ends_at / duration_min if they don't exist yet
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(reservations)").fetchall()]
+    if "ends_at" not in cols:
+        conn.execute("ALTER TABLE reservations ADD COLUMN ends_at TEXT")
+    if "duration_min" not in cols:
+        conn.execute("ALTER TABLE reservations ADD COLUMN duration_min INTEGER DEFAULT 60")
     conn.commit()
     return conn
 
@@ -220,6 +228,51 @@ def cmd_remove(args):
     conn.close()
 
 
+def pick_duration(args) -> int:
+    """Interactively ask for duration in minutes or hours. Returns total minutes."""
+    if args.minutes:
+        return int(args.minutes)
+    if args.hours:
+        return int(float(args.hours) * 60)
+
+    print(f"\n  {BOLD}Duration unit:{R}")
+    print(f"  {CYAN}1{R}  Minutes")
+    print(f"  {CYAN}2{R}  Hours")
+    choice = input("  Choose [1/2] : ").strip()
+
+    if choice == "1":
+        val = input("  Minutes     : ").strip()
+        return int(val)
+    else:
+        val = input("  Hours       : ").strip()
+        return max(1, int(float(val) * 60))
+
+
+def fmt_duration(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} min"
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def format_schedule(duration_min: int, ends_at: datetime) -> str:
+    return f"{fmt_duration(duration_min)}  (until {ends_at.strftime('%H:%M')} UTC)"
+
+
+def time_remaining(ends_at_str: str) -> str:
+    try:
+        ends = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
+        delta = int((ends - datetime.now()).total_seconds())
+        if delta <= 0:
+            return f"{RED}expired{R}"
+        h, r = divmod(delta, 3600)
+        m    = r // 60
+        clr  = GREEN if delta > 3600 else (YELLOW if delta > 600 else RED)
+        return f"{clr}{fmt_duration(h*60+m)} left{R}"
+    except Exception:
+        return "—"
+
+
 def cmd_reserve(args):
     hostname = args.host or input("  Hostname  : ").strip()
     conn = db()
@@ -234,23 +287,33 @@ def cmd_reserve(args):
     # Check if already reserved
     existing = conn.execute("SELECT * FROM reservations WHERE hostname=?", (hostname,)).fetchone()
     if existing:
-        since = existing["reserved_at"]
-        print(f"\n  {YELLOW}⚠  RESERVED{R}  —  {BOLD}{hostname}{R} is already in use\n")
-        print(f"  {DIM}User     :{R}  {CYAN}{existing['username']}{R}")
-        print(f"  {DIM}Schedule :{R}  {existing['schedule']}")
-        print(f"  {DIM}Since    :{R}  {since}\n")
+        remaining = time_remaining(existing["ends_at"]) if existing["ends_at"] else "—"
+        print(f"\n  {YELLOW}⚠  RESERVED{R}  —  {BOLD}{hostname}{R} is already booked\n")
+        print(f"  {DIM}User      :{R}  {CYAN}{existing['username']}{R}")
+        print(f"  {DIM}Schedule  :{R}  {existing['schedule']}")
+        print(f"  {DIM}Since     :{R}  {existing['reserved_at']}")
+        print(f"  {DIM}Remaining :{R}  {remaining}\n")
         print(f"  To release: python3 dashboard.py release --host {hostname}\n")
         conn.close()
         return
 
-    username = args.user     or input("  User      : ").strip()
-    schedule = args.schedule or input("  Schedule  : ").strip() or "—"
+    username = args.user or input("  User      : ").strip()
 
-    conn.execute("INSERT INTO reservations (hostname, username, schedule) VALUES (?,?,?)",
-                 (hostname, username, schedule))
+    # ── Duration picker ───────────────────────────────────────────────
+    duration_min = pick_duration(args)
+    ends_at = datetime.now() + timedelta(minutes=duration_min)
+    schedule = format_schedule(duration_min, ends_at)
+
+    conn.execute(
+        "INSERT INTO reservations (hostname, username, schedule, duration_min, ends_at) VALUES (?,?,?,?,?)",
+        (hostname, username, schedule, duration_min, ends_at.strftime("%Y-%m-%d %H:%M:%S")),
+    )
     conn.execute("UPDATE hosts SET status='reserved' WHERE hostname=?", (hostname,))
     conn.commit()
-    print(f"\n  {GREEN}✓{R}  {BOLD}{hostname}{R} reserved by {CYAN}{username}{R}  [{schedule}]\n")
+    print(f"\n  {GREEN}✓{R}  {BOLD}{hostname}{R} reserved by {CYAN}{username}{R}")
+    print(f"  Duration  : {YELLOW}{fmt_duration(duration_min)}{R}")
+    print(f"  Ends at   : {ends_at.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"  Schedule  : {schedule}\n")
     conn.close()
 
 
@@ -282,9 +345,11 @@ def cmd_status(args):
     print(f"\n  {BOLD}{hostname}{R}  —  {clr}{host['status']}{R}")
     print(f"  Product  : {host['product']}")
     if res:
+        remaining = time_remaining(res["ends_at"]) if res["ends_at"] else "—"
         print(f"  {YELLOW}Reserved by  :{R}  {CYAN}{res['username']}{R}")
         print(f"  Schedule     :  {res['schedule']}")
         print(f"  Since        :  {res['reserved_at']}")
+        print(f"  Remaining    :  {remaining}")
     else:
         print(f"  {GREEN}No active reservation.{R}")
     print()
@@ -305,7 +370,10 @@ def main():
     p.add_argument("--host")
 
     p = sub.add_parser("reserve", help="Reserve a host")
-    p.add_argument("--host");    p.add_argument("--user");    p.add_argument("--schedule")
+    p.add_argument("--host")
+    p.add_argument("--user")
+    p.add_argument("--minutes", type=int,   help="Duration in minutes")
+    p.add_argument("--hours",   type=float, help="Duration in hours")
 
     p = sub.add_parser("release", help="Release a reservation")
     p.add_argument("--host")
