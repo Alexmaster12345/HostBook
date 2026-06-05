@@ -36,6 +36,7 @@ def db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS hosts (
             hostname TEXT PRIMARY KEY,
+            os       TEXT DEFAULT '—',
             product  TEXT DEFAULT '—',
             status   TEXT DEFAULT 'available'
         )""")
@@ -50,19 +51,23 @@ def db():
             ends_at     TEXT,
             FOREIGN KEY(hostname) REFERENCES hosts(hostname)
         )""")
-    # migrate: add ends_at / duration_min if they don't exist yet
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(reservations)").fetchall()]
-    if "ends_at" not in cols:
+    # migrate reservations table
+    res_cols = [r[1] for r in conn.execute("PRAGMA table_info(reservations)").fetchall()]
+    if "ends_at" not in res_cols:
         conn.execute("ALTER TABLE reservations ADD COLUMN ends_at TEXT")
-    if "duration_min" not in cols:
+    if "duration_min" not in res_cols:
         conn.execute("ALTER TABLE reservations ADD COLUMN duration_min INTEGER DEFAULT 60")
+    # migrate hosts table — add os column if missing
+    host_cols = [r[1] for r in conn.execute("PRAGMA table_info(hosts)").fetchall()]
+    if "os" not in host_cols:
+        conn.execute("ALTER TABLE hosts ADD COLUMN os TEXT DEFAULT '—'")
     conn.commit()
     return conn
 
 
 def get_hosts(conn):
     rows = conn.execute("""
-        SELECT h.hostname, h.product, h.status,
+        SELECT h.hostname, h.os, h.product, h.status,
                r.username, r.schedule, r.reserved_at, r.ends_at, r.duration_min
         FROM hosts h
         LEFT JOIN reservations r ON r.hostname = h.hostname
@@ -98,7 +103,7 @@ def live_host_info():
     except Exception:
         uptime = "—"
 
-    return hostname, product, users, uptime
+    return hostname, product, users, uptime, product  # last = os (same source)
 
 
 # ── Countdown helper ──────────────────────────────────────────────────────────
@@ -120,19 +125,21 @@ def countdown(ends_at_str: str) -> tuple[str, str]:
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
 def render(rows, live=False):
-    cols = ["Host", "Product", "User", "Schedule", "Status"]
+    cols = ["Host", "OS", "Product", "User", "Schedule", "Status"]
 
     hostname = socket.gethostname()
-    lh, lp, lusers, luptime = live_host_info()
+    lh, lp, lusers, luptime, los = live_host_info()
 
     # Build display rows — (plain_text_tuple, colored_text_tuple)
+    # columns: host, os, product, user, schedule, status
     plain_rows   = []
     colored_rows = []
 
     for r in rows:
-        h  = r["hostname"]
-        p  = r["product"] or "—"
-        st = r["status"]
+        h   = r["hostname"]
+        ros = r.get("os") or "—"
+        p   = r["product"] or "—"
+        st  = r["status"]
 
         if r["username"]:
             u = r["username"]
@@ -143,21 +150,22 @@ def render(rows, live=False):
         elif h == hostname:
             u = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
             plain_sch = color_sch = luptime
-            st = "in_use" if lusers else "available"
+            ros = los
+            st  = "in_use" if lusers else "available"
         else:
             u = plain_sch = color_sch = "—"
 
-        plain_rows.append((h, p, u, plain_sch, st))
-        colored_rows.append((h, p, u, color_sch, st))
+        plain_rows.append((h, ros, p, u, plain_sch, st))
+        colored_rows.append((h, ros, p, u, color_sch, st))
 
     if not plain_rows:
         u  = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
         st = "in_use" if lusers else "available"
-        plain_rows   = [(lh, lp, u, luptime, st)]
-        colored_rows = [(lh, lp, u, luptime, st)]
+        plain_rows   = [(lh, los, lp, u, luptime, st)]
+        colored_rows = [(lh, los, lp, u, luptime, st)]
 
     # Column widths based on plain text (no ANSI codes)
-    widths = [max(len(cols[i]), max(len(r[i]) for r in plain_rows)) for i in range(5)]
+    widths = [max(len(cols[i]), max(len(r[i]) for r in plain_rows)) for i in range(6)]
 
     def fmt(plain_vals, color_vals=None, header=False):
         color_vals = color_vals or plain_vals
@@ -165,22 +173,23 @@ def render(rows, live=False):
         for i, (pv, cv) in enumerate(zip(plain_vals, color_vals)):
             w   = widths[i]
             pad = w - len(pv)
-            lp  = pad // 2          # left padding  (center)
-            rp  = pad - lp          # right padding
+            lpad = pad // 2
+            rpad = pad - lpad
 
             if header:
-                parts.append(f"{BOLD}{' '*lp}{pv}{' '*rp}{R}")
-            elif i == 0:
-                parts.append(f"{BOLD}{BLUE}{' '*lp}{cv}{' '*rp}{R}")
-            elif i == 2:
-                parts.append(f"{CYAN}{' '*lp}{cv}{' '*rp}{R}")
-            elif i == 3:
-                # Schedule — countdown already colored, just center it
-                parts.append(f"{' '*lp}{cv}{' '*rp}")
-            elif i == 4:
-                parts.append(f"{STATUS_CLR.get(pv, R)}{' '*lp}{cv}{' '*rp}{R}")
+                parts.append(f"{BOLD}{' '*lpad}{pv}{' '*rpad}{R}")
+            elif i == 0:                              # Host
+                parts.append(f"{BOLD}{BLUE}{' '*lpad}{cv}{' '*rpad}{R}")
+            elif i == 1:                              # OS
+                parts.append(f"{MAGENTA}{' '*lpad}{cv}{' '*rpad}{R}")
+            elif i == 3:                              # User
+                parts.append(f"{CYAN}{' '*lpad}{cv}{' '*rpad}{R}")
+            elif i == 4:                              # Schedule / countdown
+                parts.append(f"{' '*lpad}{cv}{' '*rpad}")
+            elif i == 5:                              # Status
+                parts.append(f"{STATUS_CLR.get(pv, R)}{' '*lpad}{cv}{' '*rpad}{R}")
             else:
-                parts.append(f"{' '*lp}{cv}{' '*rp}")
+                parts.append(f"{' '*lpad}{cv}{' '*rpad}")
         return "  " + "   ".join(parts)
 
     div = "  " + "   ".join("─" * w for w in widths)
@@ -198,9 +207,9 @@ def render(rows, live=False):
         print(fmt(p, c))
     print(div)
 
-    in_use   = sum(1 for r in plain_rows if r[4] == "in_use")
-    reserved = sum(1 for r in plain_rows if r[4] == "reserved")
-    avail    = sum(1 for r in plain_rows if r[4] == "available")
+    in_use   = sum(1 for r in plain_rows if r[5] == "in_use")
+    reserved = sum(1 for r in plain_rows if r[5] == "reserved")
+    avail    = sum(1 for r in plain_rows if r[5] == "available")
     print(f"\n  Total {BOLD}{len(plain_rows)}{R}   "
           f"{GREEN}Available {avail}{R}   "
           f"{CYAN}In use {in_use}{R}   "
@@ -239,13 +248,15 @@ def cmd_live(_):
 
 
 def cmd_add(args):
-    hostname = args.host or input("  Hostname  : ").strip()
+    hostname = args.host    or input("  Hostname  : ").strip()
+    ros      = args.os      or input("  OS        : ").strip() or "—"
     product  = args.product or input("  Product   : ").strip() or "—"
     conn = db()
     try:
-        conn.execute("INSERT INTO hosts (hostname, product) VALUES (?,?)", (hostname, product))
+        conn.execute("INSERT INTO hosts (hostname, os, product) VALUES (?,?,?)",
+                     (hostname, ros, product))
         conn.commit()
-        print(f"\n  {GREEN}✓{R}  Host {BOLD}{hostname}{R} added.\n")
+        print(f"\n  {GREEN}✓{R}  Host {BOLD}{hostname}{R} added  [{MAGENTA}{ros}{R}  {product}]\n")
     except sqlite3.IntegrityError:
         print(f"\n  {YELLOW}!{R}  Host {BOLD}{hostname}{R} already exists.\n")
     conn.close()
@@ -400,7 +411,9 @@ def main():
     sub.add_parser("live",    help="Live auto-refresh (q to quit)")
 
     p = sub.add_parser("add",     help="Add a host")
-    p.add_argument("--host");    p.add_argument("--product")
+    p.add_argument("--host")
+    p.add_argument("--os",      help="Operating system name")
+    p.add_argument("--product", help="Product / workload running on the host")
 
     p = sub.add_parser("remove",  help="Remove a host")
     p.add_argument("--host")
