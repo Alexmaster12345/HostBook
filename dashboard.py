@@ -63,7 +63,7 @@ def db():
 def get_hosts(conn):
     rows = conn.execute("""
         SELECT h.hostname, h.product, h.status,
-               r.username, r.schedule, r.reserved_at
+               r.username, r.schedule, r.reserved_at, r.ends_at, r.duration_min
         FROM hosts h
         LEFT JOIN reservations r ON r.hostname = h.hostname
         ORDER BY h.hostname
@@ -101,71 +101,107 @@ def live_host_info():
     return hostname, product, users, uptime
 
 
+# ── Countdown helper ──────────────────────────────────────────────────────────
+def countdown(ends_at_str: str) -> tuple[str, str]:
+    """Return (plain_text, colored_text) countdown for a reservation."""
+    try:
+        ends = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
+        secs = int((ends - datetime.now()).total_seconds())
+        if secs <= 0:
+            return "expired", f"{RED}expired{R}"
+        h, rem = divmod(secs, 3600)
+        m, s   = divmod(rem, 60)
+        text   = f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
+        clr    = GREEN if secs > 3600 else (YELLOW if secs > 300 else RED)
+        return text, f"{clr}{text}{R}"
+    except Exception:
+        return "—", "—"
+
+
 # ── Rendering ─────────────────────────────────────────────────────────────────
 def render(rows, live=False):
     cols = ["Host", "Product", "User", "Schedule", "Status"]
 
-    # Inject live host status into its row if it exists in DB
     hostname = socket.gethostname()
     lh, lp, lusers, luptime = live_host_info()
 
-    display = []
+    # Build display rows — (plain_text_tuple, colored_text_tuple)
+    plain_rows   = []
+    colored_rows = []
+
     for r in rows:
         h  = r["hostname"]
         p  = r["product"] or "—"
         st = r["status"]
+
         if r["username"]:
-            u    = r["username"]
-            sch  = r["schedule"]
+            u = r["username"]
+            if r.get("ends_at"):
+                plain_sch, color_sch = countdown(r["ends_at"])
+            else:
+                plain_sch = color_sch = r["schedule"]
         elif h == hostname:
-            # live data for current host
-            u   = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
-            sch = luptime
-            st  = "in_use" if lusers else "available"
+            u = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
+            plain_sch = color_sch = luptime
+            st = "in_use" if lusers else "available"
         else:
-            u   = "—"
-            sch = "—"
-        display.append((h, p, u, sch, st))
+            u = plain_sch = color_sch = "—"
 
-    # If DB empty, show current host only
-    if not display:
-        u   = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
-        st  = "in_use" if lusers else "available"
-        display = [(lh, lp, u, luptime, st)]
+        plain_rows.append((h, p, u, plain_sch, st))
+        colored_rows.append((h, p, u, color_sch, st))
 
-    widths = [max(len(cols[i]), max(len(r[i]) for r in display)) for i in range(5)]
+    if not plain_rows:
+        u  = ", ".join(lusers) if lusers else os.environ.get("USER", "—")
+        st = "in_use" if lusers else "available"
+        plain_rows   = [(lh, lp, u, luptime, st)]
+        colored_rows = [(lh, lp, u, luptime, st)]
 
-    def fmt(vals, header=False):
+    # Column widths based on plain text (no ANSI codes)
+    widths = [max(len(cols[i]), max(len(r[i]) for r in plain_rows)) for i in range(5)]
+
+    def fmt(plain_vals, color_vals=None, header=False):
+        color_vals = color_vals or plain_vals
         parts = []
-        for i, v in enumerate(vals):
-            w = widths[i]
-            if header:   parts.append(f"{BOLD}{v:<{w}}{R}")
-            elif i == 0: parts.append(f"{BOLD}{BLUE}{v:<{w}}{R}")
-            elif i == 2: parts.append(f"{CYAN}{v:<{w}}{R}")
-            elif i == 4: parts.append(f"{STATUS_CLR.get(v, R)}{v:<{w}}{R}")
-            else:        parts.append(f"{v:<{w}}")
+        for i, (pv, cv) in enumerate(zip(plain_vals, color_vals)):
+            w   = widths[i]
+            pad = w - len(pv)
+            lp  = pad // 2          # left padding  (center)
+            rp  = pad - lp          # right padding
+
+            if header:
+                parts.append(f"{BOLD}{' '*lp}{pv}{' '*rp}{R}")
+            elif i == 0:
+                parts.append(f"{BOLD}{BLUE}{' '*lp}{cv}{' '*rp}{R}")
+            elif i == 2:
+                parts.append(f"{CYAN}{' '*lp}{cv}{' '*rp}{R}")
+            elif i == 3:
+                # Schedule — countdown already colored, just center it
+                parts.append(f"{' '*lp}{cv}{' '*rp}")
+            elif i == 4:
+                parts.append(f"{STATUS_CLR.get(pv, R)}{' '*lp}{cv}{' '*rp}{R}")
+            else:
+                parts.append(f"{' '*lp}{cv}{' '*rp}")
         return "  " + "   ".join(parts)
 
     div = "  " + "   ".join("─" * w for w in widths)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    tag = f"  {DIM}live — refreshes every 3s   q=quit{R}" if live else ""
+    tag = f"  {DIM}live — q=quit{R}" if live else ""
 
-    # Clear and print
     if live:
-        print("\033[H\033[J", end="")   # clear screen
+        print("\033[H\033[J", end="")
 
     print(f"\n  {BOLD}HostBook{R}  {DIM}│{R}  {CYAN}{hostname}{R}  {DIM}│  {now}{R}{tag}\n")
     print(div)
     print(fmt(cols, header=True))
     print(div)
-    for r in display:
-        print(fmt(r))
+    for p, c in zip(plain_rows, colored_rows):
+        print(fmt(p, c))
     print(div)
 
-    in_use   = sum(1 for r in display if r[4] == "in_use")
-    reserved = sum(1 for r in display if r[4] == "reserved")
-    avail    = sum(1 for r in display if r[4] == "available")
-    print(f"\n  Total {BOLD}{len(display)}{R}   "
+    in_use   = sum(1 for r in plain_rows if r[4] == "in_use")
+    reserved = sum(1 for r in plain_rows if r[4] == "reserved")
+    avail    = sum(1 for r in plain_rows if r[4] == "available")
+    print(f"\n  Total {BOLD}{len(plain_rows)}{R}   "
           f"{GREEN}Available {avail}{R}   "
           f"{CYAN}In use {in_use}{R}   "
           f"{YELLOW}Reserved {reserved}{R}\n")
