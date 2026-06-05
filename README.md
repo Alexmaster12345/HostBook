@@ -111,6 +111,134 @@ npm run dev
 
 ---
 
+## CLI Dashboard (`dashboard.py`)
+
+The CLI dashboard is a standalone terminal tool for managing server reservations without the web UI. It uses a local SQLite file (`hostbook_local.db`) and requires no backend server running.
+
+### Launch
+
+```bash
+# Live auto-refresh table (updates every 3s — press q to quit)
+python3 dashboard.py live
+
+# One-shot snapshot
+python3 dashboard.py show
+```
+
+**Live mode** displays a centered table with a real-time countdown in the Schedule column. The countdown color changes as time runs out:
+
+| Color | Meaning |
+|---|---|
+| Green | More than 1 hour remaining |
+| Yellow | Less than 5 minutes remaining |
+| Red | Expired |
+
+---
+
+### Managing Hosts
+
+```bash
+# Add a host to the inventory
+python3 dashboard.py add --host host-prod-01 --product "WebSphere v9.0"
+
+# Remove a host (also removes its reservation)
+python3 dashboard.py remove --host host-prod-01
+```
+
+---
+
+### Reserving a Host
+
+Reserves a machine for a set duration. If the host is already taken, the command shows who has it and how much time is left — no double-booking is possible.
+
+**Fully interactive (recommended):**
+```bash
+python3 dashboard.py reserve --host host-prod-01
+```
+The tool will prompt step by step:
+```
+  User      : alex
+  Duration unit:
+  1  Minutes
+  2  Hours
+  Choose [1/2] : 2
+  Hours       : 1.5
+```
+
+**With flags (for scripting):**
+```bash
+# Reserve for 45 minutes
+python3 dashboard.py reserve --host host-prod-01 --user alice --minutes 45
+
+# Reserve for 2 hours
+python3 dashboard.py reserve --host host-prod-01 --user alice --hours 2
+
+# Reserve for 1.5 hours (decimals supported)
+python3 dashboard.py reserve --host host-prod-01 --user alice --hours 1.5
+```
+
+**Auto-detect the currently logged-in user with `$(whoami)`:**
+```bash
+python3 dashboard.py reserve --host host-prod-01 --user $(whoami) --hours 2
+```
+`$(whoami)` automatically fills in your Linux username so you never have to type it manually.
+
+**If the host is already reserved**, the command shows:
+```
+  ⚠  RESERVED  —  host-prod-01 is already booked
+
+  User      :  jsmith
+  Schedule  :  2h 0m  (until 21:00 UTC)
+  Since     :  2026-06-05 19:00:00
+  Remaining :  1h 25m left
+
+  To release: python3 dashboard.py release --host host-prod-01
+```
+
+---
+
+### Schedule / Duration Reference
+
+| Flag | Example | Result |
+|---|---|---|
+| `--minutes` | `--minutes 30` | 30-minute reservation |
+| `--minutes` | `--minutes 90` | 1h 30m reservation |
+| `--hours` | `--hours 1` | 1-hour reservation |
+| `--hours` | `--hours 2.5` | 2h 30m reservation |
+| *(none)* | *(interactive)* | Prompts for unit and value |
+
+The Schedule column in the table always shows a live countdown (`1h 25m 52s`) for active reservations.
+
+---
+
+### Check & Release
+
+```bash
+# See who is using a host and how much time remains
+python3 dashboard.py status --host host-prod-01
+
+# Release a reservation when done
+python3 dashboard.py release --host host-prod-01
+```
+
+---
+
+### Full Command Reference
+
+| Command | Description |
+|---|---|
+| `python3 dashboard.py` | Start live dashboard (default) |
+| `python3 dashboard.py live` | Live auto-refresh, `q` to quit |
+| `python3 dashboard.py show` | Print table once and exit |
+| `python3 dashboard.py add --host NAME --product PRODUCT` | Add a host |
+| `python3 dashboard.py remove --host NAME` | Remove a host |
+| `python3 dashboard.py reserve --host NAME --user USER --minutes N` | Reserve for N minutes |
+| `python3 dashboard.py reserve --host NAME --user USER --hours N` | Reserve for N hours |
+| `python3 dashboard.py status --host NAME` | Show who holds a host |
+| `python3 dashboard.py release --host NAME` | Free a reservation |
+
+---
+
 ## API Reference
 
 | Method | Endpoint | Description | Auth |
