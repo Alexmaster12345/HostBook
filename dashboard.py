@@ -112,6 +112,20 @@ def get_top_procs():
         return []
 
 
+def safe_addstr(stdscr, y, x, text, attr=0):
+    h, w = stdscr.getmaxyx()
+    if y < 0 or y >= h or x < 0 or x >= w:
+        return
+    text = text[:w - x]
+    try:
+        if attr:
+            stdscr.addstr(y, x, text, attr)
+        else:
+            stdscr.addstr(y, x, text)
+    except curses.error:
+        pass
+
+
 def bar(value, width=20, fill="█", empty="░"):
     filled = int(value / 100 * width)
     return fill * filled + empty * (width - filled)
@@ -153,44 +167,31 @@ def draw(stdscr):
 
         # ── Header bar ────────────────────────────────────────────────
         header = f" HostBook Dashboard  │  {hostname}  │  {ip}  │  {now} "
-        stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
-        stdscr.addstr(0, 0, header.ljust(w)[:w])
-        stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+        safe_addstr(stdscr, 0, 0, header.ljust(w)[:w], curses.color_pair(5) | curses.A_BOLD)
 
         row = 2
 
         # ── System Info ───────────────────────────────────────────────
-        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(row, 2, "SYSTEM INFO")
-        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+        safe_addstr(stdscr, row, 2, "SYSTEM INFO", curses.color_pair(4) | curses.A_BOLD)
         row += 1
 
-        stdscr.addstr(row, 4, f"Uptime   : ")
-        stdscr.attron(curses.color_pair(1))
-        stdscr.addstr(uptime)
-        stdscr.attroff(curses.color_pair(1))
-
-        stdscr.addstr(row, 35, f"Load     : ")
-        stdscr.attron(curses.color_pair(color_pct(load1 * 20)))
-        stdscr.addstr(f"{load1:.2f}  {load5:.2f}  {load15:.2f}  (1m 5m 15m)")
-        stdscr.attroff(curses.color_pair(color_pct(load1 * 20)))
+        safe_addstr(stdscr, row, 4, "Uptime   : ")
+        safe_addstr(stdscr, row, 15, uptime, curses.color_pair(1))
+        safe_addstr(stdscr, row, 35, "Load     : ")
+        safe_addstr(stdscr, row, 46, f"{load1:.2f}  {load5:.2f}  {load15:.2f}  (1m 5m 15m)",
+                    curses.color_pair(color_pct(load1 * 20)))
         row += 1
 
-        stdscr.addstr(row, 4, f"TCP Conn : ")
-        stdscr.attron(curses.color_pair(4))
-        stdscr.addstr(str(conns))
-        stdscr.attroff(curses.color_pair(4))
-
-        stdscr.addstr(row, 35, f"Users    : ")
-        stdscr.attron(curses.color_pair(1) if users else curses.color_pair(3))
-        stdscr.addstr(", ".join(users) if users else "none")
-        stdscr.attroff(curses.color_pair(1) if users else curses.color_pair(3))
+        safe_addstr(stdscr, row, 4, "TCP Conn : ")
+        safe_addstr(stdscr, row, 15, str(conns), curses.color_pair(4))
+        safe_addstr(stdscr, row, 35, "Users    : ")
+        safe_addstr(stdscr, row, 46,
+                    ", ".join(users) if users else "none",
+                    curses.color_pair(1) if users else curses.color_pair(3))
         row += 2
 
         # ── Resource Meters ───────────────────────────────────────────
-        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(row, 2, "RESOURCE USAGE")
-        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+        safe_addstr(stdscr, row, 2, "RESOURCE USAGE", curses.color_pair(4) | curses.A_BOLD)
         row += 1
 
         metrics = [
@@ -199,45 +200,37 @@ def draw(stdscr):
             ("DISK", disk_pct, f"{disk_used}GB / {disk_tot}GB  ({disk_pct}%)"),
         ]
         for label, pct, detail in metrics:
+            if row >= h - 2:
+                break
             b = bar(pct, width=30)
-            stdscr.addstr(row, 4, f"{label:<5} ")
-            stdscr.attron(curses.color_pair(color_pct(pct)))
-            stdscr.addstr(b)
-            stdscr.attroff(curses.color_pair(color_pct(pct)))
-            stdscr.addstr(f"  {detail}")
+            safe_addstr(stdscr, row, 4, f"{label:<5} ")
+            safe_addstr(stdscr, row, 10, b, curses.color_pair(color_pct(pct)))
+            safe_addstr(stdscr, row, 41, f"  {detail}")
             row += 1
 
         row += 1
 
         # ── Top Processes ─────────────────────────────────────────────
-        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-        stdscr.addstr(row, 2, "TOP PROCESSES  (by CPU)")
-        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-        row += 1
-
-        stdscr.attron(curses.color_pair(6))
-        stdscr.addstr(row, 4, f"{'USER':<10} {'CPU%':>6} {'MEM%':>6}  COMMAND")
-        stdscr.attroff(curses.color_pair(6))
-        row += 1
-
-        for user, cpu_p, mem_p, cmd in procs:
-            if row >= h - 3:
-                break
-            stdscr.addstr(row, 4, f"{user:<10} ")
-            stdscr.attron(curses.color_pair(color_pct(float(cpu_p))))
-            stdscr.addstr(f"{cpu_p:>6} ")
-            stdscr.attroff(curses.color_pair(color_pct(float(cpu_p))))
-            stdscr.attron(curses.color_pair(color_pct(float(mem_p))))
-            stdscr.addstr(f"{mem_p:>6}")
-            stdscr.attroff(curses.color_pair(color_pct(float(mem_p))))
-            stdscr.addstr(f"  {cmd}")
+        if row < h - 3:
+            safe_addstr(stdscr, row, 2, "TOP PROCESSES  (by CPU)", curses.color_pair(4) | curses.A_BOLD)
             row += 1
+            safe_addstr(stdscr, row, 4, f"{'USER':<10} {'CPU%':>6} {'MEM%':>6}  COMMAND",
+                        curses.color_pair(6))
+            row += 1
+
+            for user, cpu_p, mem_p, cmd in procs:
+                if row >= h - 2:
+                    break
+                safe_addstr(stdscr, row, 4,  f"{user:<10} ")
+                safe_addstr(stdscr, row, 15, f"{cpu_p:>6} ", curses.color_pair(color_pct(float(cpu_p))))
+                safe_addstr(stdscr, row, 22, f"{mem_p:>6}",  curses.color_pair(color_pct(float(mem_p))))
+                safe_addstr(stdscr, row, 29, f"  {cmd}")
+                row += 1
 
         # ── Footer ────────────────────────────────────────────────────
         footer = f"  [q] Quit   [r] Refresh   Auto-refresh every {REFRESH}s  "
-        stdscr.attron(curses.color_pair(5))
-        stdscr.addstr(h - 1, 0, footer.ljust(w)[:w])
-        stdscr.attroff(curses.color_pair(5))
+        # Use w-1 to avoid writing into the bottom-right corner cell
+        safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1)[:w - 1], curses.color_pair(5))
 
         stdscr.refresh()
 
