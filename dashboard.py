@@ -1,252 +1,175 @@
 #!/usr/bin/env python3
 """
-HostBook Terminal Dashboard
-Real-time system and fleet overview using curses.
-Press 'q' to quit, 'r' to refresh manually.
+HostBook CLI Dashboard
+Displays server reservations and schedules in a formatted table.
+Usage: python3 dashboard.py [--db path/to/hostbook.db]
 """
 
-import curses
 import os
-import time
-import subprocess
-import socket
+import sys
+import sqlite3
+import argparse
 from datetime import datetime
 
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "backend/db/hostbook.db"))
 
-def get_cpu_percent():
-    try:
-        with open("/proc/stat") as f:
-            line = f.readline().split()
-        idle1 = int(line[4])
-        total1 = sum(int(x) for x in line[1:])
-        time.sleep(0.1)
-        with open("/proc/stat") as f:
-            line = f.readline().split()
-        idle2 = int(line[4])
-        total2 = sum(int(x) for x in line[1:])
-        diff_idle = idle2 - idle1
-        diff_total = total2 - total1
-        return round((1 - diff_idle / diff_total) * 100, 1) if diff_total else 0.0
-    except Exception:
-        return 0.0
+# ANSI colours
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+CYAN   = "\033[96m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+RED    = "\033[91m"
+DIM    = "\033[2m"
+WHITE  = "\033[97m"
+BG_DARK = "\033[48;5;236m"
 
 
-def get_ram():
-    info = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            k, v = line.split(":")[0], line.split()[1]
-            info[k] = int(v)
-    total = info.get("MemTotal", 1)
-    available = info.get("MemAvailable", total)
-    used = total - available
-    percent = round(used / total * 100, 1)
-    return round(total / 1024), round(used / 1024), percent
+def status_color(status: str) -> str:
+    return {
+        "available":   GREEN,
+        "reserved":    YELLOW,
+        "in_use":      CYAN,
+        "maintenance": RED,
+        "offline":     DIM,
+    }.get(status, RESET)
 
 
-def get_disk():
-    stat = os.statvfs("/")
-    total = stat.f_blocks * stat.f_frsize
-    free = stat.f_bfree * stat.f_frsize
-    used = total - free
-    pct = round(used / total * 100, 1) if total else 0
-    return round(total / 1024**3), round(used / 1024**3), pct
+def schedule_label(res: dict) -> str:
+    rtype = res["reservation_type"]
+    start = datetime.fromisoformat(res["starts_at"]) if res["starts_at"] else None
+    end   = datetime.fromisoformat(res["ends_at"])   if res["ends_at"]   else None
+
+    if not start or not end:
+        return "—"
+
+    if rtype == "recurring":
+        day  = start.strftime("%A")
+        return f"Weekly (Every {day})"
+    if rtype == "daily":
+        return f"Daily ({start.strftime('%H:%M')} - {end.strftime('%H:%M')})"
+    if rtype == "multi_day":
+        days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        return f"Mon-Fri ({start.strftime('%H:%M')} - {end.strftime('%H:%M')})"
+    # hourly
+    return f"{start.strftime('%a')} ({start.strftime('%H:%M')} - {end.strftime('%H:%M')})"
 
 
-def get_load():
-    return os.getloadavg()
-
-
-def get_logged_in_users():
-    try:
-        out = subprocess.check_output(["who"], text=True)
-        users = [line.split()[0] for line in out.strip().splitlines() if line]
-        return list(set(users))
-    except Exception:
+def load_from_db(db_path: str) -> list[dict]:
+    if not os.path.exists(db_path):
         return []
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT
+            a.hostname,
+            a.os        AS product,
+            a.status,
+            u.username  AS user,
+            r.reservation_type,
+            r.starts_at,
+            r.ends_at,
+            r.purpose
+        FROM reservations r
+        JOIN assets a ON a.id = r.asset_id
+        JOIN users  u ON u.id = r.user_id
+        WHERE r.status IN ('active', 'pending')
+        ORDER BY r.starts_at
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
-def get_uptime():
-    with open("/proc/uptime") as f:
-        secs = float(f.read().split()[0])
-    d, r = divmod(int(secs), 86400)
-    h, r = divmod(r, 3600)
-    m, s = divmod(r, 60)
-    parts = []
-    if d: parts.append(f"{d}d")
-    if h: parts.append(f"{h}h")
-    parts.append(f"{m}m")
-    return " ".join(parts)
+SAMPLE = [
+    {"hostname": "host-prod-01",  "product": "WebSphere v9.0",    "status": "reserved",  "user": "jsmith",  "reservation_type": "multi_day", "starts_at": "2026-06-05 09:00", "ends_at": "2026-06-05 17:00", "purpose": None},
+    {"hostname": "host-prod-02",  "product": "OpenShift Cluster", "status": "in_use",    "user": "dnoah",   "reservation_type": "recurring", "starts_at": "2026-06-02 00:00", "ends_at": "2099-12-31 23:59", "purpose": "Permanent"},
+    {"hostname": "host-test-04",  "product": "Oracle DB 19c",     "status": "reserved",  "user": "mrossi",  "reservation_type": "daily",     "starts_at": "2026-06-07 00:00", "ends_at": "2026-06-07 23:59", "purpose": "Overtimes only"},
+    {"hostname": "host-dev-09",   "product": "JBoss EAP 7.4",    "status": "reserved",  "user": "alee",    "reservation_type": "daily",     "starts_at": "2026-06-05 18:00", "ends_at": "2026-06-06 02:00", "purpose": None},
+    {"hostname": "host-stage-03", "product": "SAP HANA",          "status": "reserved",  "user": "v-patel", "reservation_type": "recurring", "starts_at": "2026-06-09 00:00", "ends_at": "2026-06-09 23:59", "purpose": None},
+]
 
 
-def get_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "unknown"
+def build_schedule(row: dict) -> str:
+    if row.get("purpose") == "Permanent":
+        return "24/7 (Permanent)"
+    if row.get("purpose") == "Overtimes only":
+        return "Sat-Sun (Overtimes only)"
+    return schedule_label(row)
 
 
-def get_active_conns():
-    try:
-        out = subprocess.check_output(["ss", "-tn", "state", "established"], text=True)
-        return max(0, len(out.strip().splitlines()) - 1)
-    except Exception:
-        return 0
+def print_table(rows: list[dict], use_sample: bool):
+    cols = ["Host", "Product", "User", "Schedule", "Status"]
+    data = []
+    for r in rows:
+        data.append({
+            "Host":     r["hostname"],
+            "Product":  r.get("product") or "—",
+            "User":     r.get("user") or "—",
+            "Schedule": build_schedule(r),
+            "Status":   r.get("status", "—"),
+        })
 
+    widths = {c: len(c) for c in cols}
+    for row in data:
+        for c in cols:
+            widths[c] = max(widths[c], len(row[c]))
 
-def get_top_procs():
-    try:
-        out = subprocess.check_output(
-            ["ps", "aux", "--sort=-%cpu"],
-            text=True
-        ).splitlines()
-        procs = []
-        for line in out[1:6]:
-            parts = line.split(None, 10)
-            if len(parts) >= 11:
-                procs.append((parts[0], parts[2], parts[3], parts[10][:30]))
-        return procs
-    except Exception:
-        return []
+    sep = "+" + "+".join("-" * (widths[c] + 2) for c in cols) + "+"
+    header = "|" + "|".join(f" {BOLD}{WHITE}{c:<{widths[c]}}{RESET} " for c in cols) + "|"
 
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = f"  HostBook — Active Reservations   {DIM}{now}{RESET}"
+    if use_sample:
+        title += f"  {YELLOW}(sample data — no DB found){RESET}"
 
-def safe_addstr(stdscr, y, x, text, attr=0):
-    h, w = stdscr.getmaxyx()
-    if y < 0 or y >= h or x < 0 or x >= w:
-        return
-    text = text[:w - x]
-    try:
-        if attr:
-            stdscr.addstr(y, x, text, attr)
-        else:
-            stdscr.addstr(y, x, text)
-    except curses.error:
-        pass
+    print()
+    print(f"  {BOLD}{CYAN}{'─' * (sum(widths.values()) + len(cols) * 3 + 1)}{RESET}")
+    print(f"  {title}")
+    print(f"  {BOLD}{CYAN}{'─' * (sum(widths.values()) + len(cols) * 3 + 1)}{RESET}")
+    print()
+    print(sep)
+    print(header)
+    print(sep.replace("-", "="))
 
+    for i, row in enumerate(data):
+        bg = BG_DARK if i % 2 == 0 else ""
+        line = "|"
+        for c in cols:
+            val = row[c]
+            if c == "Status":
+                colored = f"{status_color(val)}{val:<{widths[c]}}{RESET}"
+            elif c == "Host":
+                colored = f"{BOLD}{val:<{widths[c]}}{RESET}"
+            elif c == "User":
+                colored = f"{CYAN}{val:<{widths[c]}}{RESET}"
+            else:
+                colored = f"{val:<{widths[c]}}"
+            line += f" {bg}{colored}{RESET} |"
+        print(line)
 
-def bar(value, width=20, fill="█", empty="░"):
-    filled = int(value / 100 * width)
-    return fill * filled + empty * (width - filled)
-
-
-def color_pct(pct):
-    if pct < 50:   return 1   # green
-    if pct < 80:   return 3   # yellow
-    return 2                   # red
-
-
-def draw(stdscr):
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN,   curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_RED,     curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_YELLOW,  curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_CYAN,    curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_WHITE,   curses.COLOR_BLUE)
-    curses.init_pair(6, curses.COLOR_BLACK,   curses.COLOR_WHITE)
-
-    REFRESH = 3  # seconds
-
-    while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
-        hostname = socket.gethostname()
-        ip       = get_ip()
-        uptime   = get_uptime()
-        cpu      = get_cpu_percent()
-        ram_tot, ram_used, ram_pct = get_ram()
-        disk_tot, disk_used, disk_pct = get_disk()
-        load1, load5, load15 = get_load()
-        users    = get_logged_in_users()
-        conns    = get_active_conns()
-        procs    = get_top_procs()
-
-        # ── Header bar ────────────────────────────────────────────────
-        header = f" HostBook Dashboard  │  {hostname}  │  {ip}  │  {now} "
-        safe_addstr(stdscr, 0, 0, header.ljust(w)[:w], curses.color_pair(5) | curses.A_BOLD)
-
-        row = 2
-
-        # ── System Info ───────────────────────────────────────────────
-        safe_addstr(stdscr, row, 2, "SYSTEM INFO", curses.color_pair(4) | curses.A_BOLD)
-        row += 1
-
-        safe_addstr(stdscr, row, 4, "Uptime   : ")
-        safe_addstr(stdscr, row, 15, uptime, curses.color_pair(1))
-        safe_addstr(stdscr, row, 35, "Load     : ")
-        safe_addstr(stdscr, row, 46, f"{load1:.2f}  {load5:.2f}  {load15:.2f}  (1m 5m 15m)",
-                    curses.color_pair(color_pct(load1 * 20)))
-        row += 1
-
-        safe_addstr(stdscr, row, 4, "TCP Conn : ")
-        safe_addstr(stdscr, row, 15, str(conns), curses.color_pair(4))
-        safe_addstr(stdscr, row, 35, "Users    : ")
-        safe_addstr(stdscr, row, 46,
-                    ", ".join(users) if users else "none",
-                    curses.color_pair(1) if users else curses.color_pair(3))
-        row += 2
-
-        # ── Resource Meters ───────────────────────────────────────────
-        safe_addstr(stdscr, row, 2, "RESOURCE USAGE", curses.color_pair(4) | curses.A_BOLD)
-        row += 1
-
-        metrics = [
-            ("CPU",  cpu,      f"{cpu}%"),
-            ("RAM",  ram_pct,  f"{ram_used}MB / {ram_tot}MB  ({ram_pct}%)"),
-            ("DISK", disk_pct, f"{disk_used}GB / {disk_tot}GB  ({disk_pct}%)"),
-        ]
-        for label, pct, detail in metrics:
-            if row >= h - 2:
-                break
-            b = bar(pct, width=30)
-            safe_addstr(stdscr, row, 4, f"{label:<5} ")
-            safe_addstr(stdscr, row, 10, b, curses.color_pair(color_pct(pct)))
-            safe_addstr(stdscr, row, 41, f"  {detail}")
-            row += 1
-
-        row += 1
-
-        # ── Top Processes ─────────────────────────────────────────────
-        if row < h - 3:
-            safe_addstr(stdscr, row, 2, "TOP PROCESSES  (by CPU)", curses.color_pair(4) | curses.A_BOLD)
-            row += 1
-            safe_addstr(stdscr, row, 4, f"{'USER':<10} {'CPU%':>6} {'MEM%':>6}  COMMAND",
-                        curses.color_pair(6))
-            row += 1
-
-            for user, cpu_p, mem_p, cmd in procs:
-                if row >= h - 2:
-                    break
-                safe_addstr(stdscr, row, 4,  f"{user:<10} ")
-                safe_addstr(stdscr, row, 15, f"{cpu_p:>6} ", curses.color_pair(color_pct(float(cpu_p))))
-                safe_addstr(stdscr, row, 22, f"{mem_p:>6}",  curses.color_pair(color_pct(float(mem_p))))
-                safe_addstr(stdscr, row, 29, f"  {cmd}")
-                row += 1
-
-        # ── Footer ────────────────────────────────────────────────────
-        footer = f"  [q] Quit   [r] Refresh   Auto-refresh every {REFRESH}s  "
-        # Use w-1 to avoid writing into the bottom-right corner cell
-        safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1)[:w - 1], curses.color_pair(5))
-
-        stdscr.refresh()
-
-        # Wait for keypress or timeout
-        for _ in range(REFRESH * 10):
-            key = stdscr.getch()
-            if key == ord("q"):
-                return
-            if key == ord("r"):
-                break
-            time.sleep(0.1)
+    print(sep)
+    print()
+    total = len(data)
+    active = sum(1 for r in rows if r.get("status") == "in_use")
+    reserved = sum(1 for r in rows if r.get("status") == "reserved")
+    print(f"  Total: {BOLD}{total}{RESET}   "
+          f"In use: {CYAN}{active}{RESET}   "
+          f"Reserved: {YELLOW}{reserved}{RESET}")
+    print()
 
 
 def main():
-    curses.wrapper(draw)
-    print("HostBook Dashboard closed.")
+    parser = argparse.ArgumentParser(description="HostBook CLI Dashboard")
+    parser.add_argument("--db", default=DB_PATH, help="Path to hostbook.db")
+    parser.add_argument("--sample", action="store_true", help="Show sample data")
+    args = parser.parse_args()
+
+    rows = [] if args.sample else load_from_db(args.db)
+    use_sample = not rows
+    if use_sample:
+        rows = SAMPLE
+
+    print_table(rows, use_sample)
 
 
 if __name__ == "__main__":
