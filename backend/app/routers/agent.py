@@ -22,7 +22,20 @@ def verify_agent(x_agent_token: str = Header(...)):
 def heartbeat(payload: MetricIn, db: Session = Depends(get_db), _=Depends(verify_agent)):
     asset = db.query(Asset).filter(Asset.hostname == payload.hostname).first()
     if not asset:
-        raise HTTPException(404, f"Unknown host: {payload.hostname}")
+        asset = Asset(
+            hostname=payload.hostname,
+            os=payload.os,
+            ip_address=payload.ip_address,
+        )
+        db.add(asset)
+        db.commit()
+        db.refresh(asset)
+
+    # Keep OS and IP up to date on every heartbeat
+    if payload.os and asset.os != payload.os:
+        asset.os = payload.os
+    if payload.ip_address and asset.ip_address != payload.ip_address:
+        asset.ip_address = payload.ip_address
 
     logic.apply_heartbeat(
         db=db,
@@ -34,7 +47,7 @@ def heartbeat(payload: MetricIn, db: Session = Depends(get_db), _=Depends(verify
         disk=payload.disk_percent,
         load=payload.load_avg,
     )
-    return {"ack": True, "asset_id": asset.id, "status": asset.status}
+    return {"ack": True, "asset_id": asset.id, "status": asset.status, "registered": True}
 
 
 @router.get("/metrics/{hostname}", response_model=List[MetricOut])

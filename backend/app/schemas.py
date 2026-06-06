@@ -106,6 +106,8 @@ class ActivityLogOut(BaseModel):
 # --- Metrics ---
 class MetricIn(BaseModel):
     hostname: str
+    os: Optional[str] = None
+    ip_address: Optional[str] = None
     cpu_percent: float
     ram_percent: float
     disk_percent: float
