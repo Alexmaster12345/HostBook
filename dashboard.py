@@ -11,7 +11,7 @@ HostBook CLI
 """
 
 import os, sys, sqlite3, argparse, socket, subprocess, platform, time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 DB = os.path.join(os.path.dirname(__file__), "hostbook_local.db")
 
@@ -65,6 +65,17 @@ def db():
     return conn
 
 
+def expire_reservations(conn):
+    expired = conn.execute(
+        "SELECT hostname FROM reservations WHERE ends_at <= datetime('now')"
+    ).fetchall()
+    for row in expired:
+        conn.execute("DELETE FROM reservations WHERE hostname=?", (row["hostname"],))
+        conn.execute("UPDATE hosts SET status='available' WHERE hostname=?", (row["hostname"],))
+    if expired:
+        conn.commit()
+
+
 def get_hosts(conn):
     rows = conn.execute("""
         SELECT h.hostname, h.os, h.product, h.status,
@@ -111,7 +122,7 @@ def countdown(ends_at_str: str) -> tuple[str, str]:
     """Return (plain_text, colored_text) countdown for a reservation."""
     try:
         ends = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
-        secs = int((ends - datetime.now()).total_seconds())
+        secs = int((ends - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds())
         if secs <= 0:
             return "expired", f"{RED}expired{R}"
         h, rem = divmod(secs, 3600)
@@ -219,6 +230,7 @@ def render(rows, live=False):
 # ── Commands ──────────────────────────────────────────────────────────────────
 def cmd_show(_):
     conn = db()
+    expire_reservations(conn)
     render(get_hosts(conn))
     conn.close()
 
@@ -232,6 +244,7 @@ def cmd_live(_):
         os.set_blocking(fd, False)
         while True:
             conn = db()
+            expire_reservations(conn)
             render(get_hosts(conn), live=True)
             conn.close()
             for _ in range(30):   # 3s in 0.1s ticks
@@ -247,7 +260,14 @@ def cmd_live(_):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def require_root():
+    if os.geteuid() != 0:
+        print(f"\n  {RED}✗{R}  Permission denied — root required to modify hosts.\n")
+        sys.exit(1)
+
+
 def cmd_add(args):
+    require_root()
     hostname = args.host    or input("  Hostname  : ").strip()
     ros      = args.os      or input("  OS        : ").strip() or "—"
     product  = args.product or input("  Product   : ").strip() or "—"
@@ -263,6 +283,7 @@ def cmd_add(args):
 
 
 def cmd_remove(args):
+    require_root()
     hostname = args.host or input("  Hostname  : ").strip()
     conn = db()
     conn.execute("DELETE FROM reservations WHERE hostname=?", (hostname,))
@@ -309,7 +330,7 @@ def format_schedule(duration_min: int, ends_at: datetime) -> str:
 def time_remaining(ends_at_str: str) -> str:
     try:
         ends = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
-        delta = int((ends - datetime.now()).total_seconds())
+        delta = int((ends - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds())
         if delta <= 0:
             return f"{RED}expired{R}"
         h, r = divmod(delta, 3600)
@@ -323,6 +344,7 @@ def time_remaining(ends_at_str: str) -> str:
 def cmd_reserve(args):
     hostname = args.host or input("  Hostname  : ").strip()
     conn = db()
+    expire_reservations(conn)
 
     # Check host exists
     host = conn.execute("SELECT * FROM hosts WHERE hostname=?", (hostname,)).fetchone()
@@ -334,21 +356,42 @@ def cmd_reserve(args):
     # Check if already reserved
     existing = conn.execute("SELECT * FROM reservations WHERE hostname=?", (hostname,)).fetchone()
     if existing:
-        remaining = time_remaining(existing["ends_at"]) if existing["ends_at"] else "—"
-        print(f"\n  {YELLOW}⚠  RESERVED{R}  —  {BOLD}{hostname}{R} is already booked\n")
-        print(f"  {DIM}User      :{R}  {CYAN}{existing['username']}{R}")
-        print(f"  {DIM}Schedule  :{R}  {existing['schedule']}")
-        print(f"  {DIM}Since     :{R}  {existing['reserved_at']}")
-        print(f"  {DIM}Remaining :{R}  {remaining}\n")
-        print(f"  To release: python3 dashboard.py release --host {hostname}\n")
+        ends_at_str = existing["ends_at"] or ""
+        remaining   = time_remaining(ends_at_str) if ends_at_str else "—"
+
+        # Progress bar: how much of the reservation has elapsed
+        bar = ""
+        try:
+            ends   = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
+            total  = existing["duration_min"] * 60
+            left   = max(0, int((ends - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()))
+            used   = total - left
+            filled = int((used / total) * 20) if total else 0
+            bar_clr = GREEN if left > 3600 else (YELLOW if left > 300 else RED)
+            bar = f"  {DIM}[{R}{bar_clr}{'█' * filled}{R}{DIM}{'░' * (20 - filled)}]{R}"
+        except Exception:
+            pass
+
+        div = f"  {'─' * 42}"
+        print(f"\n{div}")
+        print(f"  {YELLOW}{BOLD}⚠  HOST TAKEN{R}  —  {BOLD}{hostname}{R} is already reserved")
+        print(div)
+        print(f"  {DIM}Reserved by :{R}  {CYAN}{BOLD}{existing['username']}{R}")
+        print(f"  {DIM}Since       :{R}  {existing['reserved_at']}")
+        print(f"  {DIM}Duration    :{R}  {existing['schedule']}")
+        print(f"  {DIM}Time left   :{R}  {remaining}")
+        if bar:
+            print(bar)
+        print(div)
+        print(f"  {DIM}To release  :{R}  python3 dashboard.py release --host {hostname}\n")
         conn.close()
         return
 
-    username = args.user or input("  User      : ").strip()
+    username = args.user or os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
 
     # ── Duration picker ───────────────────────────────────────────────
     duration_min = pick_duration(args)
-    ends_at = datetime.now() + timedelta(minutes=duration_min)
+    ends_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=duration_min)
     schedule = format_schedule(duration_min, ends_at)
 
     conn.execute(
